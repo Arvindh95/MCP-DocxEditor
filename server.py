@@ -14,11 +14,16 @@ Supports:
 
 import os
 import re
+import copy
 from difflib import SequenceMatcher
 from docx import Document
-from docx.shared import Pt
+from docx.shared import Pt, Inches, RGBColor, Twips, Cm
 from docx.table import Table
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK, WD_LINE_SPACING
+from docx.enum.style import WD_STYLE_TYPE
+from docx.enum.section import WD_ORIENT, WD_SECTION
+from docx.oxml.ns import qn, nsmap
+from docx.oxml import OxmlElement
 from fastmcp import FastMCP
 
 # Define the default document path (now in documents/ folder)
@@ -26,6 +31,7 @@ DEFAULT_DOCX_PATH = os.environ.get("DOCX_PATH", os.path.join("documents", "MCP.d
 
 # Global variable to track current active document
 CURRENT_DOCX_PATH = DEFAULT_DOCX_PATH
+
 
 # Create the MCP server
 mcp = FastMCP(name="Docx Editor")
@@ -602,6 +608,61 @@ async def update_paragraph(
 
     save_document(doc)
     return {"status": "success", "message": f"Paragraph {id} updated."}
+
+
+@mcp.tool()
+async def insert_before_text(
+    query: str,
+    text: str,
+    threshold: float = 0.5,
+    bold: bool = False,
+    italic: bool = False,
+    alignment: str = None,
+    style: str = None
+) -> dict:
+    """
+    INSERT CONTENT BEFORE a specific paragraph in the document with optional formatting.
+    Finds any paragraph by text search and inserts new content immediately before it.
+
+    Use this tool whenever you need to:
+    - Insert before a specific section
+    - Add content before certain text
+    - Place new paragraphs at arbitrary positions (not just at the end)
+
+    Args:
+        query: The text to search for - finds the paragraph containing or matching this text
+        text: The text content to insert as a new paragraph before the found location
+        threshold: Minimum similarity score 0-1 (default 0.5)
+        bold: Make text bold (default False)
+        italic: Make text italic (default False)
+        alignment: Text alignment - "left", "center", "right", "justify" (default left)
+        style: Word style name - "Heading 1", "Title", etc.
+    """
+    doc = get_document()
+
+    match = find_paragraph_by_text(doc, query, threshold)
+
+    if not match:
+        return {"error": f"No paragraph found matching: '{query}'"}
+
+    idx, para, score = match
+
+    # Insert a new paragraph before the found one
+    new_para = doc.add_paragraph(text)
+
+    # Move the new paragraph to the correct position (before the found paragraph)
+    para._element.addprevious(new_para._element)
+
+    # Apply formatting
+    apply_paragraph_formatting(new_para, bold=bold, italic=italic, alignment=alignment, style=style)
+
+    save_document(doc)
+
+    return {
+        "status": "success",
+        "message": f"Content inserted before paragraph {idx} (match score: {score:.2f})",
+        "matched_text": para.text[:100] + "..." if len(para.text) > 100 else para.text
+    }
 
 
 @mcp.tool()
@@ -1364,28 +1425,1923 @@ async def save_document_as(filename: str) -> dict:
     }
 
 
+# ============================================
+# Paragraph Management Tools
+# ============================================
+
+@mcp.tool()
+async def delete_paragraph(query: str, threshold: float = 0.5) -> dict:
+    """
+    DELETE a paragraph from the document by fuzzy text search.
+
+    Args:
+        query: The text to search for - finds and deletes the paragraph containing or matching this text
+        threshold: Minimum similarity score 0-1 (default 0.5)
+    """
+    doc = get_document()
+
+    match = find_paragraph_by_text(doc, query, threshold)
+
+    if not match:
+        return {"error": f"No paragraph found matching: '{query}'"}
+
+    idx, para, score = match
+    deleted_text = para.text
+
+    # Delete the paragraph using XML manipulation
+    para._element.getparent().remove(para._element)
+
+    save_document(doc)
+
+    return {
+        "status": "success",
+        "message": f"Deleted paragraph {idx} (match score: {score:.2f})",
+        "deleted_text": deleted_text[:100] + "..." if len(deleted_text) > 100 else deleted_text
+    }
+
+
+@mcp.tool()
+async def move_paragraph(query: str, target_query: str, position: str = "after", threshold: float = 0.5) -> dict:
+    """
+    MOVE a paragraph to a new location in the document.
+
+    Args:
+        query: Text to search for to find the paragraph to move
+        target_query: Text to search for to find the target location
+        position: Where to place relative to target - "before" or "after" (default "after")
+        threshold: Minimum similarity score 0-1 (default 0.5)
+    """
+    doc = get_document()
+
+    # Find the source paragraph
+    source_match = find_paragraph_by_text(doc, query, threshold)
+    if not source_match:
+        return {"error": f"No paragraph found matching source: '{query}'"}
+
+    source_idx, source_para, source_score = source_match
+
+    # Find the target paragraph
+    target_match = find_paragraph_by_text(doc, target_query, threshold)
+    if not target_match:
+        return {"error": f"No paragraph found matching target: '{target_query}'"}
+
+    target_idx, target_para, target_score = target_match
+
+    if source_idx == target_idx:
+        return {"error": "Source and target paragraphs are the same"}
+
+    # Store the source element
+    source_element = source_para._element
+
+    # Remove from current position
+    source_element.getparent().remove(source_element)
+
+    # Insert at new position
+    if position.lower() == "before":
+        target_para._element.addprevious(source_element)
+    else:
+        target_para._element.addnext(source_element)
+
+    save_document(doc)
+
+    return {
+        "status": "success",
+        "message": f"Moved paragraph {position} target",
+        "moved_text": source_para.text[:100] + "..." if len(source_para.text) > 100 else source_para.text,
+        "target_text": target_para.text[:100] + "..." if len(target_para.text) > 100 else target_para.text
+    }
+
+
+@mcp.tool()
+async def merge_paragraphs(query1: str, query2: str, separator: str = " ", threshold: float = 0.5) -> dict:
+    """
+    MERGE two paragraphs into one. The second paragraph's text is appended to the first,
+    then the second paragraph is deleted.
+
+    Args:
+        query1: Text to search for the first paragraph (will be kept)
+        query2: Text to search for the second paragraph (will be merged and deleted)
+        separator: Text to insert between the two paragraphs (default is a space)
+        threshold: Minimum similarity score 0-1 (default 0.5)
+    """
+    doc = get_document()
+
+    # Find both paragraphs
+    match1 = find_paragraph_by_text(doc, query1, threshold)
+    if not match1:
+        return {"error": f"No paragraph found matching: '{query1}'"}
+
+    match2 = find_paragraph_by_text(doc, query2, threshold)
+    if not match2:
+        return {"error": f"No paragraph found matching: '{query2}'"}
+
+    idx1, para1, score1 = match1
+    idx2, para2, score2 = match2
+
+    if idx1 == idx2:
+        return {"error": "Both queries match the same paragraph"}
+
+    # Merge text
+    original_text1 = para1.text
+    para2_text = para2.text
+
+    # Add separator and second paragraph text to first paragraph
+    if para1.runs:
+        para1.runs[-1].text += separator + para2_text
+    else:
+        para1.add_run(separator + para2_text)
+
+    # Delete the second paragraph
+    para2._element.getparent().remove(para2._element)
+
+    save_document(doc)
+
+    return {
+        "status": "success",
+        "message": f"Merged paragraphs {idx1} and {idx2}",
+        "merged_text": para1.text[:150] + "..." if len(para1.text) > 150 else para1.text
+    }
+
+
+# ============================================
+# Document Structure & Stats Tools
+# ============================================
+
+@mcp.tool()
+async def get_document_outline() -> dict:
+    """
+    Get the document's heading structure/outline.
+    Returns a hierarchical view of all headings in the document.
+    Useful for navigating large documents.
+    """
+    doc = get_document()
+    outline = []
+
+    for idx, para in enumerate(doc.paragraphs):
+        if para.style and para.style.name.startswith('Heading'):
+            # Extract heading level
+            try:
+                level = int(para.style.name.replace('Heading ', ''))
+            except ValueError:
+                level = 0
+
+            outline.append({
+                "id": f"para-{idx}",
+                "level": level,
+                "text": para.text[:100] + "..." if len(para.text) > 100 else para.text,
+                "style": para.style.name
+            })
+        elif para.style and para.style.name == 'Title':
+            outline.append({
+                "id": f"para-{idx}",
+                "level": 0,
+                "text": para.text[:100] + "..." if len(para.text) > 100 else para.text,
+                "style": "Title"
+            })
+
+    return {
+        "total_headings": len(outline),
+        "outline": outline
+    }
+
+
+@mcp.tool()
+async def get_document_stats() -> dict:
+    """
+    Get document statistics including word count, character count, paragraph count, etc.
+    """
+    doc = get_document()
+
+    total_paragraphs = 0
+    non_empty_paragraphs = 0
+    total_words = 0
+    total_characters = 0
+    total_characters_no_spaces = 0
+    total_tables = len(doc.tables)
+    total_images = 0
+
+    for para in doc.paragraphs:
+        total_paragraphs += 1
+        text = para.text.strip()
+        if text:
+            non_empty_paragraphs += 1
+            words = text.split()
+            total_words += len(words)
+            total_characters += len(text)
+            total_characters_no_spaces += len(text.replace(' ', ''))
+
+    # Count images (inline shapes)
+    for para in doc.paragraphs:
+        for run in para.runs:
+            if run._element.xpath('.//a:blip'):
+                total_images += 1
+
+    # Count table cells content
+    table_words = 0
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                table_words += len(cell.text.split())
+
+    return {
+        "paragraphs": {
+            "total": total_paragraphs,
+            "non_empty": non_empty_paragraphs
+        },
+        "words": total_words + table_words,
+        "characters": total_characters,
+        "characters_no_spaces": total_characters_no_spaces,
+        "tables": total_tables,
+        "images": total_images
+    }
+
+
+# ============================================
+# Page & Section Tools
+# ============================================
+
+@mcp.tool()
+async def insert_page_break(query: str = None, threshold: float = 0.5) -> dict:
+    """
+    Insert a page break in the document.
+
+    Args:
+        query: Optional text to search for - inserts page break after matching paragraph.
+               If not provided, adds page break at the end of the document.
+        threshold: Minimum similarity score 0-1 (default 0.5)
+    """
+    doc = get_document()
+
+    if query:
+        match = find_paragraph_by_text(doc, query, threshold)
+        if not match:
+            return {"error": f"No paragraph found matching: '{query}'"}
+
+        idx, para, score = match
+
+        # Add a new paragraph with page break after the matched paragraph
+        new_para = doc.add_paragraph()
+        run = new_para.add_run()
+        run.add_break(WD_BREAK.PAGE)
+
+        # Move it after the matched paragraph
+        para._element.addnext(new_para._element)
+
+        save_document(doc)
+
+        return {
+            "status": "success",
+            "message": f"Page break inserted after paragraph {idx}",
+            "after_text": para.text[:100] + "..." if len(para.text) > 100 else para.text
+        }
+    else:
+        # Add page break at the end
+        para = doc.add_paragraph()
+        run = para.add_run()
+        run.add_break(WD_BREAK.PAGE)
+
+        save_document(doc)
+
+        return {
+            "status": "success",
+            "message": "Page break added at the end of the document"
+        }
+
+
+@mcp.tool()
+async def insert_image(
+    image_path: str,
+    query: str = None,
+    width: float = None,
+    height: float = None,
+    threshold: float = 0.5
+) -> dict:
+    """
+    Insert an image into the document.
+
+    Args:
+        image_path: Path to the image file (supports PNG, JPG, GIF, BMP, etc.)
+        query: Optional text to search for - inserts image after matching paragraph.
+               If not provided, adds image at the end of the document.
+        width: Optional width in inches (e.g., 4.0 for 4 inches)
+        height: Optional height in inches (e.g., 3.0 for 3 inches)
+        threshold: Minimum similarity score 0-1 (default 0.5)
+    """
+    # Check if image exists
+    if not os.path.exists(image_path):
+        return {"error": f"Image file not found: {image_path}"}
+
+    doc = get_document()
+
+    # Prepare size arguments
+    size_kwargs = {}
+    if width:
+        size_kwargs['width'] = Inches(width)
+    if height:
+        size_kwargs['height'] = Inches(height)
+
+    if query:
+        match = find_paragraph_by_text(doc, query, threshold)
+        if not match:
+            return {"error": f"No paragraph found matching: '{query}'"}
+
+        idx, para, score = match
+
+        # Create a new paragraph for the image
+        new_para = doc.add_paragraph()
+        run = new_para.add_run()
+        run.add_picture(image_path, **size_kwargs)
+
+        # Move it after the matched paragraph
+        para._element.addnext(new_para._element)
+
+        save_document(doc)
+
+        return {
+            "status": "success",
+            "message": f"Image inserted after paragraph {idx}",
+            "image": os.path.basename(image_path),
+            "after_text": para.text[:100] + "..." if len(para.text) > 100 else para.text
+        }
+    else:
+        # Add image at the end
+        doc.add_picture(image_path, **size_kwargs)
+
+        save_document(doc)
+
+        return {
+            "status": "success",
+            "message": "Image added at the end of the document",
+            "image": os.path.basename(image_path)
+        }
+
+
+# ============================================
+# List Tools
+# ============================================
+
+@mcp.tool()
+async def create_list(
+    items: list,
+    list_type: str = "bullet",
+    query: str = None,
+    threshold: float = 0.5
+) -> dict:
+    """
+    Create a bulleted or numbered list in the document.
+
+    Args:
+        items: List of strings - each string becomes a list item
+        list_type: Type of list - "bullet" or "number" (default "bullet")
+        query: Optional text to search for - inserts list after matching paragraph.
+               If not provided, adds list at the end of the document.
+        threshold: Minimum similarity score 0-1 (default 0.5)
+    """
+    if not items:
+        return {"error": "No items provided for the list"}
+
+    doc = get_document()
+
+    # Determine the list style
+    if list_type.lower() in ["number", "numbered", "ordered"]:
+        style_name = "List Number"
+    else:
+        style_name = "List Bullet"
+
+    insert_after_para = None
+    if query:
+        match = find_paragraph_by_text(doc, query, threshold)
+        if not match:
+            return {"error": f"No paragraph found matching: '{query}'"}
+        idx, insert_after_para, score = match
+
+    # Create list items
+    created_paragraphs = []
+    for item in items:
+        para = doc.add_paragraph(item)
+        try:
+            para.style = style_name
+        except KeyError:
+            # Style doesn't exist, just leave as normal paragraph
+            pass
+        created_paragraphs.append(para)
+
+    # Move paragraphs to correct position if query was provided
+    if insert_after_para:
+        # Move in reverse order to maintain order
+        for para in reversed(created_paragraphs):
+            insert_after_para._element.addnext(para._element)
+
+    save_document(doc)
+
+    return {
+        "status": "success",
+        "message": f"Created {list_type} list with {len(items)} items",
+        "items_count": len(items),
+        "list_type": list_type
+    }
+
+
+@mcp.tool()
+async def add_list_item(
+    query: str,
+    text: str,
+    list_type: str = "bullet",
+    threshold: float = 0.5
+) -> dict:
+    """
+    Add an item to an existing list. Finds a list item and adds a new item after it.
+
+    Args:
+        query: Text to search for to find existing list item
+        text: The text for the new list item
+        list_type: Type of list - "bullet" or "number" (default "bullet")
+        threshold: Minimum similarity score 0-1 (default 0.5)
+    """
+    doc = get_document()
+
+    match = find_paragraph_by_text(doc, query, threshold)
+    if not match:
+        return {"error": f"No paragraph found matching: '{query}'"}
+
+    idx, para, score = match
+
+    # Determine the list style
+    if list_type.lower() in ["number", "numbered", "ordered"]:
+        style_name = "List Number"
+    else:
+        style_name = "List Bullet"
+
+    # Create new list item
+    new_para = doc.add_paragraph(text)
+    try:
+        new_para.style = style_name
+    except KeyError:
+        pass
+
+    # Insert after the matched paragraph
+    para._element.addnext(new_para._element)
+
+    save_document(doc)
+
+    return {
+        "status": "success",
+        "message": f"Added list item after paragraph {idx}",
+        "new_item": text
+    }
+
+
+# ============================================
+# Advanced Formatting Tools
+# ============================================
+
+@mcp.tool()
+async def clear_formatting(query: str, threshold: float = 0.5) -> dict:
+    """
+    Remove ALL formatting from a paragraph, resetting it to plain text with Normal style.
+
+    Args:
+        query: Text to search for to find the paragraph
+        threshold: Minimum similarity score 0-1 (default 0.5)
+    """
+    doc = get_document()
+
+    match = find_paragraph_by_text(doc, query, threshold)
+    if not match:
+        return {"error": f"No paragraph found matching: '{query}'"}
+
+    idx, para, score = match
+
+    # Reset paragraph style to Normal
+    try:
+        para.style = 'Normal'
+    except KeyError:
+        pass
+
+    # Clear run-level formatting
+    for run in para.runs:
+        run.bold = False
+        run.italic = False
+        run.underline = False
+        run.font.size = None  # Reset to default
+        run.font.color.rgb = None  # Reset color
+        run.font.name = None  # Reset font
+
+    # Reset paragraph alignment
+    para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+    save_document(doc)
+
+    return {
+        "status": "success",
+        "message": f"Cleared all formatting from paragraph {idx}",
+        "text": para.text[:100] + "..." if len(para.text) > 100 else para.text
+    }
+
+
+# ============================================
+# Hyperlink & Bookmark Tools
+# ============================================
+
+def add_hyperlink(paragraph, url, text):
+    """
+    Helper function to add a hyperlink to a paragraph.
+    python-docx doesn't have built-in hyperlink support, so we use XML manipulation.
+    """
+    # Get the document part
+    part = paragraph.part
+    r_id = part.relate_to(url, 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink', is_external=True)
+
+    # Create the hyperlink element
+    hyperlink = OxmlElement('w:hyperlink')
+    hyperlink.set(qn('r:id'), r_id)
+
+    # Create a new run for the hyperlink text
+    new_run = OxmlElement('w:r')
+    rPr = OxmlElement('w:rPr')
+
+    # Add hyperlink styling (blue and underlined)
+    color = OxmlElement('w:color')
+    color.set(qn('w:val'), '0000FF')
+    rPr.append(color)
+
+    u = OxmlElement('w:u')
+    u.set(qn('w:val'), 'single')
+    rPr.append(u)
+
+    new_run.append(rPr)
+
+    # Add the text
+    text_elem = OxmlElement('w:t')
+    text_elem.text = text
+    new_run.append(text_elem)
+
+    hyperlink.append(new_run)
+    paragraph._p.append(hyperlink)
+
+    return hyperlink
+
+
+@mcp.tool()
+async def insert_hyperlink(
+    url: str,
+    display_text: str,
+    query: str = None,
+    threshold: float = 0.5
+) -> dict:
+    """
+    Insert a clickable hyperlink into the document.
+
+    Args:
+        url: The URL the hyperlink points to (e.g., "https://example.com")
+        display_text: The visible text for the hyperlink
+        query: Optional text to search for - adds hyperlink to end of matching paragraph.
+               If not provided, creates a new paragraph with the hyperlink.
+        threshold: Minimum similarity score 0-1 (default 0.5)
+    """
+    doc = get_document()
+
+    if query:
+        match = find_paragraph_by_text(doc, query, threshold)
+        if not match:
+            return {"error": f"No paragraph found matching: '{query}'"}
+
+        idx, para, score = match
+
+        # Add hyperlink to the paragraph
+        add_hyperlink(para, url, display_text)
+
+        save_document(doc)
+
+        return {
+            "status": "success",
+            "message": f"Hyperlink added to paragraph {idx}",
+            "url": url,
+            "display_text": display_text
+        }
+    else:
+        # Create new paragraph with hyperlink
+        para = doc.add_paragraph()
+        add_hyperlink(para, url, display_text)
+
+        save_document(doc)
+
+        return {
+            "status": "success",
+            "message": "Hyperlink added in new paragraph at end of document",
+            "url": url,
+            "display_text": display_text
+        }
+
+
+@mcp.tool()
+async def insert_bookmark(query: str, bookmark_name: str, threshold: float = 0.5) -> dict:
+    """
+    Insert a bookmark at a specific paragraph location.
+    Bookmarks can be used for internal document references.
+
+    Args:
+        query: Text to search for to find the paragraph to bookmark
+        bookmark_name: Name for the bookmark (no spaces, use underscores)
+        threshold: Minimum similarity score 0-1 (default 0.5)
+    """
+    doc = get_document()
+
+    match = find_paragraph_by_text(doc, query, threshold)
+    if not match:
+        return {"error": f"No paragraph found matching: '{query}'"}
+
+    idx, para, score = match
+
+    # Clean bookmark name (remove spaces, special characters)
+    clean_name = re.sub(r'[^a-zA-Z0-9_]', '_', bookmark_name)
+
+    # Create bookmark start element
+    bookmark_start = OxmlElement('w:bookmarkStart')
+    bookmark_start.set(qn('w:id'), str(idx))  # Use paragraph index as bookmark ID
+    bookmark_start.set(qn('w:name'), clean_name)
+
+    # Create bookmark end element
+    bookmark_end = OxmlElement('w:bookmarkEnd')
+    bookmark_end.set(qn('w:id'), str(idx))
+
+    # Insert bookmark around paragraph content
+    para._p.insert(0, bookmark_start)
+    para._p.append(bookmark_end)
+
+    save_document(doc)
+
+    return {
+        "status": "success",
+        "message": f"Bookmark '{clean_name}' added to paragraph {idx}",
+        "bookmark_name": clean_name,
+        "paragraph_text": para.text[:100] + "..." if len(para.text) > 100 else para.text
+    }
+
+
+# ============================================
+# Header & Footer Tools
+# ============================================
+
+@mcp.tool()
+async def get_header(section_index: int = 0) -> dict:
+    """
+    Get the header content from a document section.
+
+    Args:
+        section_index: Index of the section (default 0 for first section)
+    """
+    doc = get_document()
+
+    if section_index >= len(doc.sections):
+        return {"error": f"Section {section_index} not found. Document has {len(doc.sections)} section(s)."}
+
+    section = doc.sections[section_index]
+    header = section.header
+
+    # Get all paragraphs in header
+    header_text = []
+    for para in header.paragraphs:
+        if para.text.strip():
+            header_text.append(para.text)
+
+    return {
+        "section_index": section_index,
+        "has_header": len(header_text) > 0,
+        "header_text": "\n".join(header_text) if header_text else "(empty)",
+        "paragraphs": len(header.paragraphs)
+    }
+
+
+@mcp.tool()
+async def set_header(
+    text: str,
+    section_index: int = 0,
+    alignment: str = "center"
+) -> dict:
+    """
+    Set the header content for a document section.
+
+    Args:
+        text: The header text to set
+        section_index: Index of the section (default 0 for first section)
+        alignment: Text alignment - "left", "center", "right" (default "center")
+    """
+    doc = get_document()
+
+    if section_index >= len(doc.sections):
+        return {"error": f"Section {section_index} not found. Document has {len(doc.sections)} section(s)."}
+
+    section = doc.sections[section_index]
+    header = section.header
+
+    # Clear existing header content
+    for para in header.paragraphs:
+        para.clear()
+
+    # Add new header text
+    if header.paragraphs:
+        para = header.paragraphs[0]
+    else:
+        para = header.add_paragraph()
+
+    para.text = text
+
+    # Apply alignment
+    alignment_map = {
+        "left": WD_ALIGN_PARAGRAPH.LEFT,
+        "center": WD_ALIGN_PARAGRAPH.CENTER,
+        "right": WD_ALIGN_PARAGRAPH.RIGHT
+    }
+    if alignment.lower() in alignment_map:
+        para.alignment = alignment_map[alignment.lower()]
+
+    save_document(doc)
+
+    return {
+        "status": "success",
+        "message": f"Header set for section {section_index}",
+        "header_text": text
+    }
+
+
+@mcp.tool()
+async def get_footer(section_index: int = 0) -> dict:
+    """
+    Get the footer content from a document section.
+
+    Args:
+        section_index: Index of the section (default 0 for first section)
+    """
+    doc = get_document()
+
+    if section_index >= len(doc.sections):
+        return {"error": f"Section {section_index} not found. Document has {len(doc.sections)} section(s)."}
+
+    section = doc.sections[section_index]
+    footer = section.footer
+
+    # Get all paragraphs in footer
+    footer_text = []
+    for para in footer.paragraphs:
+        if para.text.strip():
+            footer_text.append(para.text)
+
+    return {
+        "section_index": section_index,
+        "has_footer": len(footer_text) > 0,
+        "footer_text": "\n".join(footer_text) if footer_text else "(empty)",
+        "paragraphs": len(footer.paragraphs)
+    }
+
+
+@mcp.tool()
+async def set_footer(
+    text: str,
+    section_index: int = 0,
+    alignment: str = "center"
+) -> dict:
+    """
+    Set the footer content for a document section.
+
+    Args:
+        text: The footer text to set
+        section_index: Index of the section (default 0 for first section)
+        alignment: Text alignment - "left", "center", "right" (default "center")
+    """
+    doc = get_document()
+
+    if section_index >= len(doc.sections):
+        return {"error": f"Section {section_index} not found. Document has {len(doc.sections)} section(s)."}
+
+    section = doc.sections[section_index]
+    footer = section.footer
+
+    # Clear existing footer content
+    for para in footer.paragraphs:
+        para.clear()
+
+    # Add new footer text
+    if footer.paragraphs:
+        para = footer.paragraphs[0]
+    else:
+        para = footer.add_paragraph()
+
+    para.text = text
+
+    # Apply alignment
+    alignment_map = {
+        "left": WD_ALIGN_PARAGRAPH.LEFT,
+        "center": WD_ALIGN_PARAGRAPH.CENTER,
+        "right": WD_ALIGN_PARAGRAPH.RIGHT
+    }
+    if alignment.lower() in alignment_map:
+        para.alignment = alignment_map[alignment.lower()]
+
+    save_document(doc)
+
+    return {
+        "status": "success",
+        "message": f"Footer set for section {section_index}",
+        "footer_text": text
+    }
+
+
+# ============================================
+# Document Properties Tools
+# ============================================
+
+@mcp.tool()
+async def get_document_properties() -> dict:
+    """
+    Get document metadata/properties like title, author, subject, etc.
+    """
+    doc = get_document()
+    props = doc.core_properties
+
+    return {
+        "title": props.title or "(not set)",
+        "author": props.author or "(not set)",
+        "subject": props.subject or "(not set)",
+        "keywords": props.keywords or "(not set)",
+        "comments": props.comments or "(not set)",
+        "category": props.category or "(not set)",
+        "created": str(props.created) if props.created else "(not set)",
+        "modified": str(props.modified) if props.modified else "(not set)",
+        "last_modified_by": props.last_modified_by or "(not set)"
+    }
+
+
+@mcp.tool()
+async def set_document_properties(
+    title: str = None,
+    author: str = None,
+    subject: str = None,
+    keywords: str = None,
+    comments: str = None,
+    category: str = None
+) -> dict:
+    """
+    Set document metadata/properties.
+    Only provided fields will be updated; others remain unchanged.
+
+    Args:
+        title: Document title
+        author: Document author name
+        subject: Document subject
+        keywords: Keywords (comma-separated)
+        comments: Comments/description
+        category: Document category
+    """
+    doc = get_document()
+    props = doc.core_properties
+
+    updated = []
+
+    if title is not None:
+        props.title = title
+        updated.append("title")
+    if author is not None:
+        props.author = author
+        updated.append("author")
+    if subject is not None:
+        props.subject = subject
+        updated.append("subject")
+    if keywords is not None:
+        props.keywords = keywords
+        updated.append("keywords")
+    if comments is not None:
+        props.comments = comments
+        updated.append("comments")
+    if category is not None:
+        props.category = category
+        updated.append("category")
+
+    if not updated:
+        return {"error": "No properties provided to update"}
+
+    save_document(doc)
+
+    return {
+        "status": "success",
+        "message": f"Updated document properties: {', '.join(updated)}",
+        "updated_fields": updated
+    }
+
+
+# ============================================
+# Table Column Tools
+# ============================================
+
+@mcp.tool()
+async def add_table_column(
+    table_index: int,
+    column_data: list = None,
+    position: int = None
+) -> dict:
+    """
+    Add a new column to a table.
+
+    Args:
+        table_index: The index of the table (from list_tables, starting at 0)
+        column_data: Optional list of cell values for the new column (one per row)
+        position: Optional column position (0-indexed). If not provided, adds at the end.
+    """
+    doc = get_document()
+
+    if table_index < 0 or table_index >= len(doc.tables):
+        return {"error": f"Table index {table_index} not found. Document has {len(doc.tables)} table(s)."}
+
+    table = doc.tables[table_index]
+    num_rows = len(table.rows)
+    num_cols = len(table.columns)
+
+    # Determine insertion position
+    if position is None:
+        position = num_cols
+    elif position < 0 or position > num_cols:
+        position = num_cols
+
+    # Add a cell to each row
+    for row_idx, row in enumerate(table.rows):
+        # Create a new cell element
+        new_cell = OxmlElement('w:tc')
+
+        # Add cell properties
+        tcPr = OxmlElement('w:tcPr')
+        tcW = OxmlElement('w:tcW')
+        tcW.set(qn('w:w'), '0')
+        tcW.set(qn('w:type'), 'auto')
+        tcPr.append(tcW)
+        new_cell.append(tcPr)
+
+        # Add paragraph to cell
+        p = OxmlElement('w:p')
+        new_cell.append(p)
+
+        # Insert at the correct position
+        cells = row._tr.findall(qn('w:tc'))
+        if position < len(cells):
+            cells[position].addprevious(new_cell)
+        else:
+            row._tr.append(new_cell)
+
+    # Reload the table to get proper cell references
+    table = doc.tables[table_index]
+
+    # Fill in data if provided
+    if column_data:
+        for row_idx, value in enumerate(column_data):
+            if row_idx < len(table.rows):
+                row = table.rows[row_idx]
+                if position < len(row.cells):
+                    row.cells[position].text = str(value)
+
+    save_document(doc)
+
+    return {
+        "status": "success",
+        "message": f"Added column at position {position} in table {table_index}",
+        "new_column_count": num_cols + 1
+    }
+
+
+@mcp.tool()
+async def delete_table_column(table_index: int, column: int) -> dict:
+    """
+    Delete a column from a table.
+
+    Args:
+        table_index: The index of the table (from list_tables, starting at 0)
+        column: The column index to delete (starting at 0)
+    """
+    doc = get_document()
+
+    if table_index < 0 or table_index >= len(doc.tables):
+        return {"error": f"Table index {table_index} not found. Document has {len(doc.tables)} table(s)."}
+
+    table = doc.tables[table_index]
+
+    if column < 0 or column >= len(table.columns):
+        return {"error": f"Column index {column} out of range. Table has {len(table.columns)} columns."}
+
+    # Delete the cell at the specified column in each row
+    for row in table.rows:
+        cells = row._tr.findall(qn('w:tc'))
+        if column < len(cells):
+            row._tr.remove(cells[column])
+
+    save_document(doc)
+
+    return {
+        "status": "success",
+        "message": f"Deleted column {column} from table {table_index}",
+        "remaining_columns": len(table.columns) - 1
+    }
+
+
+# ============================================
+# Document Creation Tools
+# ============================================
+
+@mcp.tool()
+async def create_document(filename: str, title: str = None, switch_to: bool = True) -> dict:
+    """
+    Create a new blank DOCX document.
+
+    Args:
+        filename: Name for the new document (e.g., "report.docx")
+        title: Optional title to add as the first paragraph
+        switch_to: Whether to switch to the new document after creation (default True)
+    """
+    global CURRENT_DOCX_PATH
+
+    # Ensure .docx extension
+    if not filename.endswith('.docx'):
+        filename += '.docx'
+
+    # Check if file already exists
+    if os.path.exists(filename):
+        return {"error": f"File '{filename}' already exists. Use a different name or delete the existing file."}
+
+    # Create new document
+    doc = Document()
+
+    # Add title if provided
+    if title:
+        para = doc.add_paragraph(title)
+        para.style = 'Title'
+
+    # Save the document
+    doc.save(filename)
+
+    # Switch to the new document if requested
+    if switch_to:
+        CURRENT_DOCX_PATH = filename
+
+    return {
+        "status": "success",
+        "message": f"Created new document: {filename}",
+        "path": os.path.abspath(filename),
+        "switched_to": switch_to
+    }
+
+
+# ============================================
+# Table Management Tools
+# ============================================
+
+@mcp.tool()
+async def delete_table(table_index: int) -> dict:
+    """
+    Delete an entire table from the document.
+
+    Args:
+        table_index: The index of the table to delete (from list_tables, starting at 0)
+    """
+    doc = get_document()
+
+    if table_index < 0 or table_index >= len(doc.tables):
+        return {"error": f"Table index {table_index} not found. Document has {len(doc.tables)} table(s)."}
+
+    table = doc.tables[table_index]
+
+    # Get table info before deleting
+    rows = len(table.rows)
+    cols = len(table.columns)
+
+    # Delete the table using XML manipulation
+    table._element.getparent().remove(table._element)
+
+    save_document(doc)
+
+    return {
+        "status": "success",
+        "message": f"Deleted table {table_index} ({rows}x{cols})",
+        "remaining_tables": len(doc.tables) - 1
+    }
+
+
+@mcp.tool()
+async def merge_table_cells(
+    table_index: int,
+    start_row: int,
+    start_col: int,
+    end_row: int,
+    end_col: int
+) -> dict:
+    """
+    Merge a range of cells in a table.
+
+    Args:
+        table_index: The index of the table (from list_tables, starting at 0)
+        start_row: Starting row index (0-indexed)
+        start_col: Starting column index (0-indexed)
+        end_row: Ending row index (0-indexed, inclusive)
+        end_col: Ending column index (0-indexed, inclusive)
+    """
+    doc = get_document()
+
+    if table_index < 0 or table_index >= len(doc.tables):
+        return {"error": f"Table index {table_index} not found. Document has {len(doc.tables)} table(s)."}
+
+    table = doc.tables[table_index]
+
+    # Validate indices
+    if start_row < 0 or end_row >= len(table.rows):
+        return {"error": f"Row indices out of range. Table has {len(table.rows)} rows."}
+    if start_col < 0 or end_col >= len(table.columns):
+        return {"error": f"Column indices out of range. Table has {len(table.columns)} columns."}
+    if start_row > end_row or start_col > end_col:
+        return {"error": "Start indices must be less than or equal to end indices."}
+
+    # Get the cells to merge
+    start_cell = table.rows[start_row].cells[start_col]
+    end_cell = table.rows[end_row].cells[end_col]
+
+    # Merge the cells
+    start_cell.merge(end_cell)
+
+    save_document(doc)
+
+    return {
+        "status": "success",
+        "message": f"Merged cells from ({start_row},{start_col}) to ({end_row},{end_col}) in table {table_index}"
+    }
+
+
+# ============================================
+# Paragraph Duplication Tools
+# ============================================
+
+@mcp.tool()
+async def duplicate_paragraph(
+    query: str,
+    target_query: str = None,
+    position: str = "after",
+    threshold: float = 0.5
+) -> dict:
+    """
+    Duplicate/copy a paragraph to another location in the document.
+
+    Args:
+        query: Text to search for to find the paragraph to duplicate
+        target_query: Text to search for to find where to place the copy.
+                      If not provided, places copy right after the original.
+        position: Where to place relative to target - "before" or "after" (default "after")
+        threshold: Minimum similarity score 0-1 (default 0.5)
+    """
+    doc = get_document()
+
+    # Find the source paragraph
+    source_match = find_paragraph_by_text(doc, query, threshold)
+    if not source_match:
+        return {"error": f"No paragraph found matching: '{query}'"}
+
+    source_idx, source_para, source_score = source_match
+
+    # Determine target location
+    if target_query:
+        target_match = find_paragraph_by_text(doc, target_query, threshold)
+        if not target_match:
+            return {"error": f"No paragraph found matching target: '{target_query}'"}
+        target_idx, target_para, target_score = target_match
+    else:
+        target_para = source_para
+        position = "after"
+
+    # Create a copy of the paragraph
+    new_para = doc.add_paragraph()
+
+    # Copy the text and formatting
+    for run in source_para.runs:
+        new_run = new_para.add_run(run.text)
+        new_run.bold = run.bold
+        new_run.italic = run.italic
+        new_run.underline = run.underline
+        if run.font.size:
+            new_run.font.size = run.font.size
+        if run.font.name:
+            new_run.font.name = run.font.name
+
+    # Copy paragraph style
+    if source_para.style:
+        try:
+            new_para.style = source_para.style
+        except:
+            pass
+
+    # Copy alignment
+    if source_para.alignment:
+        new_para.alignment = source_para.alignment
+
+    # Move to correct position
+    if position.lower() == "before":
+        target_para._element.addprevious(new_para._element)
+    else:
+        target_para._element.addnext(new_para._element)
+
+    save_document(doc)
+
+    return {
+        "status": "success",
+        "message": f"Duplicated paragraph {position} target",
+        "duplicated_text": source_para.text[:100] + "..." if len(source_para.text) > 100 else source_para.text
+    }
+
+
+@mcp.tool()
+async def split_paragraph(query: str, split_at: str, threshold: float = 0.5) -> dict:
+    """
+    Split a paragraph into two at a specific text point.
+
+    Args:
+        query: Text to search for to find the paragraph to split
+        split_at: The text at which to split the paragraph (everything after this becomes the new paragraph)
+        threshold: Minimum similarity score 0-1 (default 0.5)
+    """
+    doc = get_document()
+
+    match = find_paragraph_by_text(doc, query, threshold)
+    if not match:
+        return {"error": f"No paragraph found matching: '{query}'"}
+
+    idx, para, score = match
+
+    # Find the split point
+    full_text = para.text
+    split_index = full_text.find(split_at)
+
+    if split_index == -1:
+        return {"error": f"Split text '{split_at}' not found in the paragraph."}
+
+    # Calculate where to split (after the split_at text)
+    split_point = split_index + len(split_at)
+    first_part = full_text[:split_point]
+    second_part = full_text[split_point:].lstrip()
+
+    if not second_part:
+        return {"error": "Nothing to split - the split point is at the end of the paragraph."}
+
+    # Update the original paragraph with first part
+    for run in para.runs:
+        run.text = ""
+    if para.runs:
+        para.runs[0].text = first_part
+    else:
+        para.add_run(first_part)
+
+    # Create new paragraph with second part
+    new_para = doc.add_paragraph(second_part)
+
+    # Copy style from original
+    if para.style:
+        try:
+            new_para.style = para.style
+        except:
+            pass
+
+    # Move new paragraph right after original
+    para._element.addnext(new_para._element)
+
+    save_document(doc)
+
+    return {
+        "status": "success",
+        "message": f"Split paragraph {idx} at '{split_at}'",
+        "first_part": first_part[:100] + "..." if len(first_part) > 100 else first_part,
+        "second_part": second_part[:100] + "..." if len(second_part) > 100 else second_part
+    }
+
+
+# ============================================
+# Style Tools
+# ============================================
+
+@mcp.tool()
+async def get_styles(style_type: str = "all") -> dict:
+    """
+    List all available styles in the document.
+
+    Args:
+        style_type: Type of styles to list - "paragraph", "character", "table", or "all" (default "all")
+    """
+    doc = get_document()
+    styles_list = []
+
+    type_map = {
+        "paragraph": WD_STYLE_TYPE.PARAGRAPH,
+        "character": WD_STYLE_TYPE.CHARACTER,
+        "table": WD_STYLE_TYPE.TABLE,
+        "list": WD_STYLE_TYPE.LIST
+    }
+
+    for style in doc.styles:
+        # Filter by type if specified
+        if style_type != "all":
+            if style_type.lower() in type_map:
+                if style.type != type_map[style_type.lower()]:
+                    continue
+            else:
+                continue
+
+        style_info = {
+            "name": style.name,
+            "type": str(style.type).replace("WD_STYLE_TYPE.", ""),
+            "builtin": style.builtin
+        }
+
+        # Add base style if available
+        if style.base_style:
+            style_info["base_style"] = style.base_style.name
+
+        styles_list.append(style_info)
+
+    # Sort by type and name
+    styles_list.sort(key=lambda x: (x["type"], x["name"]))
+
+    return {
+        "total_styles": len(styles_list),
+        "filter": style_type,
+        "styles": styles_list
+    }
+
+
+# ============================================
+# Bookmark & Hyperlink Listing Tools
+# ============================================
+
+@mcp.tool()
+async def list_bookmarks() -> dict:
+    """
+    List all bookmarks in the document.
+    """
+    doc = get_document()
+    bookmarks = []
+
+    # Find all bookmark start elements in the document
+    for para_idx, para in enumerate(doc.paragraphs):
+        bookmark_starts = para._element.findall('.//w:bookmarkStart', {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'})
+        for bookmark in bookmark_starts:
+            name = bookmark.get(qn('w:name'))
+            bookmark_id = bookmark.get(qn('w:id'))
+            if name and not name.startswith('_'):  # Skip internal bookmarks
+                bookmarks.append({
+                    "name": name,
+                    "id": bookmark_id,
+                    "paragraph_index": para_idx,
+                    "paragraph_preview": para.text[:100] + "..." if len(para.text) > 100 else para.text
+                })
+
+    return {
+        "total_bookmarks": len(bookmarks),
+        "bookmarks": bookmarks
+    }
+
+
+@mcp.tool()
+async def list_hyperlinks() -> dict:
+    """
+    List all hyperlinks in the document.
+    """
+    doc = get_document()
+    hyperlinks = []
+
+    for para_idx, para in enumerate(doc.paragraphs):
+        # Find hyperlink elements
+        hyperlink_elements = para._element.findall('.//w:hyperlink', {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'})
+
+        for hyperlink in hyperlink_elements:
+            r_id = hyperlink.get(qn('r:id'))
+            anchor = hyperlink.get(qn('w:anchor'))
+
+            # Get the display text
+            text_elements = hyperlink.findall('.//w:t', {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'})
+            display_text = ''.join(t.text for t in text_elements if t.text)
+
+            # Try to get the URL from relationships
+            url = None
+            if r_id:
+                try:
+                    rel = para.part.rels[r_id]
+                    url = rel.target_ref
+                except:
+                    pass
+
+            hyperlinks.append({
+                "display_text": display_text,
+                "url": url or "(internal link)",
+                "anchor": anchor,
+                "paragraph_index": para_idx
+            })
+
+    return {
+        "total_hyperlinks": len(hyperlinks),
+        "hyperlinks": hyperlinks
+    }
+
+
+@mcp.tool()
+async def remove_bookmark(bookmark_name: str) -> dict:
+    """
+    Remove a bookmark from the document.
+
+    Args:
+        bookmark_name: The name of the bookmark to remove
+    """
+    doc = get_document()
+    removed = False
+
+    # Find and remove bookmark start and end elements
+    for para in doc.paragraphs:
+        bookmark_starts = para._element.findall('.//w:bookmarkStart', {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'})
+        for bookmark in bookmark_starts:
+            name = bookmark.get(qn('w:name'))
+            if name == bookmark_name:
+                bookmark_id = bookmark.get(qn('w:id'))
+
+                # Remove bookmark start
+                bookmark.getparent().remove(bookmark)
+
+                # Find and remove corresponding bookmark end
+                for p in doc.paragraphs:
+                    bookmark_ends = p._element.findall('.//w:bookmarkEnd', {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'})
+                    for end in bookmark_ends:
+                        if end.get(qn('w:id')) == bookmark_id:
+                            end.getparent().remove(end)
+
+                removed = True
+                break
+        if removed:
+            break
+
+    if not removed:
+        return {"error": f"Bookmark '{bookmark_name}' not found in the document."}
+
+    save_document(doc)
+
+    return {
+        "status": "success",
+        "message": f"Removed bookmark '{bookmark_name}'"
+    }
+
+
+@mcp.tool()
+async def remove_hyperlink(query: str, threshold: float = 0.5) -> dict:
+    """
+    Remove a hyperlink from the document, keeping the display text.
+
+    Args:
+        query: Text to search for to find the paragraph containing the hyperlink
+        threshold: Minimum similarity score 0-1 (default 0.5)
+    """
+    doc = get_document()
+
+    match = find_paragraph_by_text(doc, query, threshold)
+    if not match:
+        return {"error": f"No paragraph found matching: '{query}'"}
+
+    idx, para, score = match
+    removed_count = 0
+
+    # Find and remove hyperlinks in this paragraph
+    hyperlinks = para._element.findall('.//w:hyperlink', {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'})
+
+    for hyperlink in hyperlinks:
+        # Get all runs inside the hyperlink
+        runs = hyperlink.findall('.//w:r', {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'})
+
+        # Move runs outside the hyperlink
+        parent = hyperlink.getparent()
+        index = list(parent).index(hyperlink)
+
+        for run in runs:
+            parent.insert(index, run)
+            index += 1
+
+        # Remove the empty hyperlink element
+        parent.remove(hyperlink)
+        removed_count += 1
+
+    if removed_count == 0:
+        return {"error": "No hyperlinks found in the matched paragraph."}
+
+    save_document(doc)
+
+    return {
+        "status": "success",
+        "message": f"Removed {removed_count} hyperlink(s) from paragraph {idx}",
+        "paragraph_text": para.text[:100] + "..." if len(para.text) > 100 else para.text
+    }
+
+
+# ============================================
+# Page Layout Tools
+# ============================================
+
+@mcp.tool()
+async def set_page_margins(
+    top: float = None,
+    bottom: float = None,
+    left: float = None,
+    right: float = None,
+    section_index: int = 0
+) -> dict:
+    """
+    Set page margins for a document section.
+    All measurements are in inches.
+
+    Args:
+        top: Top margin in inches (e.g., 1.0)
+        bottom: Bottom margin in inches
+        left: Left margin in inches
+        right: Right margin in inches
+        section_index: Index of the section to modify (default 0)
+    """
+    doc = get_document()
+
+    if section_index >= len(doc.sections):
+        return {"error": f"Section {section_index} not found. Document has {len(doc.sections)} section(s)."}
+
+    section = doc.sections[section_index]
+    updated = []
+
+    if top is not None:
+        section.top_margin = Inches(top)
+        updated.append(f"top={top}\"")
+    if bottom is not None:
+        section.bottom_margin = Inches(bottom)
+        updated.append(f"bottom={bottom}\"")
+    if left is not None:
+        section.left_margin = Inches(left)
+        updated.append(f"left={left}\"")
+    if right is not None:
+        section.right_margin = Inches(right)
+        updated.append(f"right={right}\"")
+
+    if not updated:
+        return {"error": "No margins specified to update."}
+
+    save_document(doc)
+
+    return {
+        "status": "success",
+        "message": f"Updated margins for section {section_index}: {', '.join(updated)}",
+        "current_margins": {
+            "top": section.top_margin.inches,
+            "bottom": section.bottom_margin.inches,
+            "left": section.left_margin.inches,
+            "right": section.right_margin.inches
+        }
+    }
+
+
+@mcp.tool()
+async def set_page_size(
+    width: float = None,
+    height: float = None,
+    orientation: str = None,
+    preset: str = None,
+    section_index: int = 0
+) -> dict:
+    """
+    Set page size for a document section.
+
+    Args:
+        width: Page width in inches (ignored if preset is used)
+        height: Page height in inches (ignored if preset is used)
+        orientation: "portrait" or "landscape"
+        preset: Preset page size - "letter", "a4", "legal", "a3", "a5"
+        section_index: Index of the section to modify (default 0)
+    """
+    doc = get_document()
+
+    if section_index >= len(doc.sections):
+        return {"error": f"Section {section_index} not found. Document has {len(doc.sections)} section(s)."}
+
+    section = doc.sections[section_index]
+
+    # Page size presets (width x height in inches)
+    presets = {
+        "letter": (8.5, 11),
+        "legal": (8.5, 14),
+        "a4": (8.27, 11.69),
+        "a3": (11.69, 16.54),
+        "a5": (5.83, 8.27)
+    }
+
+    if preset:
+        preset_lower = preset.lower()
+        if preset_lower not in presets:
+            return {"error": f"Unknown preset '{preset}'. Available: {', '.join(presets.keys())}"}
+        width, height = presets[preset_lower]
+
+    if width is not None:
+        section.page_width = Inches(width)
+    if height is not None:
+        section.page_height = Inches(height)
+
+    if orientation:
+        if orientation.lower() == "landscape":
+            section.orientation = WD_ORIENT.LANDSCAPE
+            # Swap dimensions if needed
+            if section.page_width < section.page_height:
+                section.page_width, section.page_height = section.page_height, section.page_width
+        elif orientation.lower() == "portrait":
+            section.orientation = WD_ORIENT.PORTRAIT
+            # Swap dimensions if needed
+            if section.page_width > section.page_height:
+                section.page_width, section.page_height = section.page_height, section.page_width
+
+    save_document(doc)
+
+    return {
+        "status": "success",
+        "message": f"Updated page size for section {section_index}",
+        "current_size": {
+            "width": round(section.page_width.inches, 2),
+            "height": round(section.page_height.inches, 2),
+            "orientation": "landscape" if section.orientation == WD_ORIENT.LANDSCAPE else "portrait"
+        }
+    }
+
+
+@mcp.tool()
+async def set_paragraph_spacing(
+    query: str,
+    line_spacing: float = None,
+    space_before: float = None,
+    space_after: float = None,
+    threshold: float = 0.5
+) -> dict:
+    """
+    Set spacing for a paragraph.
+
+    Args:
+        query: Text to search for to find the paragraph
+        line_spacing: Line spacing multiplier (e.g., 1.0 for single, 1.5, 2.0 for double)
+        space_before: Space before paragraph in points (e.g., 12)
+        space_after: Space after paragraph in points (e.g., 12)
+        threshold: Minimum similarity score 0-1 (default 0.5)
+    """
+    doc = get_document()
+
+    match = find_paragraph_by_text(doc, query, threshold)
+    if not match:
+        return {"error": f"No paragraph found matching: '{query}'"}
+
+    idx, para, score = match
+    updated = []
+
+    if line_spacing is not None:
+        para.paragraph_format.line_spacing = line_spacing
+        updated.append(f"line_spacing={line_spacing}")
+
+    if space_before is not None:
+        para.paragraph_format.space_before = Pt(space_before)
+        updated.append(f"space_before={space_before}pt")
+
+    if space_after is not None:
+        para.paragraph_format.space_after = Pt(space_after)
+        updated.append(f"space_after={space_after}pt")
+
+    if not updated:
+        return {"error": "No spacing values specified to update."}
+
+    save_document(doc)
+
+    return {
+        "status": "success",
+        "message": f"Updated spacing for paragraph {idx}: {', '.join(updated)}",
+        "paragraph_text": para.text[:100] + "..." if len(para.text) > 100 else para.text
+    }
+
+
+# ============================================
+# Section Tools
+# ============================================
+
+@mcp.tool()
+async def get_sections() -> dict:
+    """
+    List all sections in the document with their properties.
+    """
+    doc = get_document()
+    sections_list = []
+
+    for idx, section in enumerate(doc.sections):
+        section_info = {
+            "index": idx,
+            "page_width": round(section.page_width.inches, 2),
+            "page_height": round(section.page_height.inches, 2),
+            "orientation": "landscape" if section.orientation == WD_ORIENT.LANDSCAPE else "portrait",
+            "margins": {
+                "top": round(section.top_margin.inches, 2),
+                "bottom": round(section.bottom_margin.inches, 2),
+                "left": round(section.left_margin.inches, 2),
+                "right": round(section.right_margin.inches, 2)
+            },
+            "has_header": bool(section.header.paragraphs and any(p.text for p in section.header.paragraphs)),
+            "has_footer": bool(section.footer.paragraphs and any(p.text for p in section.footer.paragraphs))
+        }
+        sections_list.append(section_info)
+
+    return {
+        "total_sections": len(sections_list),
+        "sections": sections_list
+    }
+
+
+@mcp.tool()
+async def add_section_break(
+    query: str = None,
+    break_type: str = "next_page",
+    threshold: float = 0.5
+) -> dict:
+    """
+    Add a section break to the document.
+
+    Args:
+        query: Optional text to search for - adds section break after matching paragraph.
+               If not provided, adds at the end of the document.
+        break_type: Type of section break - "next_page", "continuous", "even_page", "odd_page"
+        threshold: Minimum similarity score 0-1 (default 0.5)
+    """
+    doc = get_document()
+
+    break_types = {
+        "next_page": WD_SECTION.NEW_PAGE,
+        "continuous": WD_SECTION.CONTINUOUS,
+        "even_page": WD_SECTION.EVEN_PAGE,
+        "odd_page": WD_SECTION.ODD_PAGE
+    }
+
+    if break_type.lower() not in break_types:
+        return {"error": f"Unknown break type '{break_type}'. Available: {', '.join(break_types.keys())}"}
+
+    if query:
+        match = find_paragraph_by_text(doc, query, threshold)
+        if not match:
+            return {"error": f"No paragraph found matching: '{query}'"}
+        idx, para, score = match
+
+        # Add a paragraph after the matched one
+        new_para = doc.add_paragraph()
+        para._element.addnext(new_para._element)
+
+        # Get the section and set the break type
+        # We need to add section properties to the paragraph
+        sectPr = OxmlElement('w:sectPr')
+        type_elem = OxmlElement('w:type')
+        type_elem.set(qn('w:val'), break_type.lower().replace('_', ''))
+        sectPr.append(type_elem)
+        new_para._element.append(sectPr)
+
+        message = f"Section break ({break_type}) added after paragraph {idx}"
+    else:
+        # Add section break at end
+        new_section = doc.add_section(break_types[break_type.lower()])
+        message = f"Section break ({break_type}) added at end of document"
+
+    save_document(doc)
+
+    return {
+        "status": "success",
+        "message": message,
+        "total_sections": len(doc.sections)
+    }
+
+
+@mcp.tool()
+async def insert_line_break(query: str, after_text: str = None, threshold: float = 0.5) -> dict:
+    """
+    Insert a soft line break (Shift+Enter) within a paragraph.
+    This creates a new line without starting a new paragraph.
+
+    Args:
+        query: Text to search for to find the paragraph
+        after_text: Optional text after which to insert the line break.
+                    If not provided, adds at the end of the paragraph.
+        threshold: Minimum similarity score 0-1 (default 0.5)
+    """
+    doc = get_document()
+
+    match = find_paragraph_by_text(doc, query, threshold)
+    if not match:
+        return {"error": f"No paragraph found matching: '{query}'"}
+
+    idx, para, score = match
+
+    if after_text:
+        # Find the run containing the text and insert break after it
+        found = False
+        for run in para.runs:
+            if after_text in run.text:
+                # Split the run at the specified text
+                parts = run.text.split(after_text, 1)
+                if len(parts) == 2:
+                    run.text = parts[0] + after_text
+                    # Add line break
+                    run.add_break(WD_BREAK.LINE)
+                    # Add remaining text in a new run
+                    if parts[1]:
+                        new_run = para.add_run(parts[1])
+                found = True
+                break
+
+        if not found:
+            return {"error": f"Text '{after_text}' not found in the paragraph."}
+    else:
+        # Add line break at the end of the last run
+        if para.runs:
+            para.runs[-1].add_break(WD_BREAK.LINE)
+        else:
+            run = para.add_run()
+            run.add_break(WD_BREAK.LINE)
+
+    save_document(doc)
+
+    return {
+        "status": "success",
+        "message": f"Line break inserted in paragraph {idx}",
+        "paragraph_text": para.text[:100] + "..." if len(para.text) > 100 else para.text
+    }
+
+
+# ============================================
+# Image Management Tools
+# ============================================
+
+@mcp.tool()
+async def delete_image(query: str, image_index: int = 0, threshold: float = 0.5) -> dict:
+    """
+    Delete an image from the document.
+
+    Args:
+        query: Text to search for to find the paragraph containing the image
+        image_index: If multiple images in paragraph, which one to delete (0-indexed, default 0)
+        threshold: Minimum similarity score 0-1 (default 0.5)
+    """
+    doc = get_document()
+
+    match = find_paragraph_by_text(doc, query, threshold)
+    if not match:
+        return {"error": f"No paragraph found matching: '{query}'"}
+
+    idx, para, score = match
+
+    # Find images (drawings) in the paragraph
+    images = []
+    for run in para.runs:
+        drawings = run._element.findall('.//a:blip', {'a': 'http://schemas.openxmlformats.org/drawingml/2006/main'})
+        if drawings:
+            images.append((run, drawings))
+
+    if not images:
+        return {"error": "No images found in the matched paragraph."}
+
+    if image_index >= len(images):
+        return {"error": f"Image index {image_index} out of range. Paragraph has {len(images)} image(s)."}
+
+    # Delete the run containing the image
+    run_to_delete, _ = images[image_index]
+    run_to_delete._element.getparent().remove(run_to_delete._element)
+
+    save_document(doc)
+
+    return {
+        "status": "success",
+        "message": f"Deleted image {image_index} from paragraph {idx}",
+        "remaining_images": len(images) - 1
+    }
+
+
 if __name__ == "__main__":
+    # Ensure the documents directory exists
+    os.makedirs("documents", exist_ok=True)
+
     # Ensure the default document exists or create a blank one
     if not os.path.exists(CURRENT_DOCX_PATH):
         print(f"Creating new document at {CURRENT_DOCX_PATH}")
         doc = Document()
         doc.save(CURRENT_DOCX_PATH)
 
-    print(f"Starting Docx MCP Server...")
-    print(f"Current document: {os.path.abspath(CURRENT_DOCX_PATH)}")
-    print(f"Use 'switch_document' to work on a different file")
-    print(f"\nAvailable tools:")
-    print("  - get_current_document, list_documents, switch_document")
-    print("  - search, fetch (ChatGPT required)")
-    print("  - read_document, get_paragraphs")
-    print("  - add_paragraph, update_paragraph")
-    print("  - insert_after_text, insert_after_heading")
-    print("  - list_placeholders, replace_placeholder, replace_placeholders")
-    print("  - replace_text (find and replace any text)")
-    print("  - insert_table, convert_text_to_table")
-    print("  - list_tables, read_table, update_table_cell, add_table_row, update_table_row, delete_table_row")
-    print("  - format_paragraph (apply formatting to existing text)")
-    print("  - save_document_as")
+    print("=" * 60)
+    print("        DOCX MCP SERVER")
+    print("=" * 60)
+    print(f"\nCurrent document: {os.path.abspath(CURRENT_DOCX_PATH)}")
+    print(f"\n🌐 Server: http://localhost:8000")
+    print(f"   SSE Endpoint: http://localhost:8000/sse")
+
+    print("\n📝 Quick Tips:")
+    print("   - Use 'switch_document' to work on different files")
+    print("   - 60+ tools available for document editing")
+    print("=" * 60)
     print()
 
-    mcp.run(transport="sse", host="0.0.0.0", port=8000)
+    # Run the server
+    mcp.run(
+        transport="sse",
+        host="0.0.0.0",
+        port=8000
+    )
