@@ -233,6 +233,51 @@ def detect_table_format(text: str) -> tuple[str, list[list[str]]]:
     return None, []
 
 
+def copy_paragraph_formatting(source_para, target_para):
+    """
+    Copy formatting from source paragraph to target paragraph.
+    Includes: style, alignment, indentation, spacing, and run formatting.
+
+    Args:
+        source_para: The paragraph to copy formatting from
+        target_para: The paragraph to apply formatting to
+    """
+    # Copy paragraph-level formatting
+    try:
+        target_para.style = source_para.style
+    except:
+        pass
+
+    target_para.alignment = source_para.alignment
+
+    # Copy paragraph format properties
+    if source_para.paragraph_format:
+        target_format = target_para.paragraph_format
+        source_format = source_para.paragraph_format
+
+        # Indentation
+        target_format.left_indent = source_format.left_indent
+        target_format.right_indent = source_format.right_indent
+        target_format.first_line_indent = source_format.first_line_indent
+
+        # Spacing
+        target_format.space_before = source_format.space_before
+        target_format.space_after = source_format.space_after
+        target_format.line_spacing = source_format.line_spacing
+        target_format.line_spacing_rule = source_format.line_spacing_rule
+
+    # Copy run formatting from the first run (if exists)
+    if source_para.runs and target_para.runs:
+        source_run = source_para.runs[0]
+        for target_run in target_para.runs:
+            target_run.bold = source_run.bold
+            target_run.italic = source_run.italic
+            target_run.underline = source_run.underline
+            target_run.font.size = source_run.font.size
+            target_run.font.name = source_run.font.name
+            target_run.font.color.rgb = source_run.font.color.rgb
+
+
 def apply_paragraph_formatting(paragraph, bold: bool = False, italic: bool = False,
                                alignment: str = None, style: str = None):
     """
@@ -615,6 +660,7 @@ async def insert_before_text(
     query: str,
     text: str,
     threshold: float = 0.5,
+    copy_formatting: bool = True,
     bold: bool = False,
     italic: bool = False,
     alignment: str = None,
@@ -633,10 +679,11 @@ async def insert_before_text(
         query: The text to search for - finds the paragraph containing or matching this text
         text: The text content to insert as a new paragraph before the found location
         threshold: Minimum similarity score 0-1 (default 0.5)
-        bold: Make text bold (default False)
-        italic: Make text italic (default False)
-        alignment: Text alignment - "left", "center", "right", "justify" (default left)
-        style: Word style name - "Heading 1", "Title", etc.
+        copy_formatting: Copy formatting from the reference paragraph (default True) - includes style, alignment, indentation, spacing, font
+        bold: Make text bold (default False) - only used if copy_formatting is False
+        italic: Make text italic (default False) - only used if copy_formatting is False
+        alignment: Text alignment - "left", "center", "right", "justify" - only used if copy_formatting is False
+        style: Word style name - "Heading 1", "Title", etc. - only used if copy_formatting is False
     """
     doc = get_document()
 
@@ -654,7 +701,10 @@ async def insert_before_text(
     para._element.addprevious(new_para._element)
 
     # Apply formatting
-    apply_paragraph_formatting(new_para, bold=bold, italic=italic, alignment=alignment, style=style)
+    if copy_formatting:
+        copy_paragraph_formatting(para, new_para)
+    else:
+        apply_paragraph_formatting(new_para, bold=bold, italic=italic, alignment=alignment, style=style)
 
     save_document(doc)
 
@@ -670,6 +720,7 @@ async def insert_after_text(
     query: str,
     text: str,
     threshold: float = 0.5,
+    copy_formatting: bool = True,
     bold: bool = False,
     italic: bool = False,
     alignment: str = None,
@@ -689,10 +740,11 @@ async def insert_after_text(
         query: The text to search for - finds the paragraph containing or matching this text
         text: The text content to insert as a new paragraph after the found location
         threshold: Minimum similarity score 0-1 (default 0.5)
-        bold: Make text bold (default False)
-        italic: Make text italic (default False)
-        alignment: Text alignment - "left", "center", "right", "justify" (default left)
-        style: Word style name - "Heading 1", "Title", etc.
+        copy_formatting: Copy formatting from the reference paragraph (default True) - includes style, alignment, indentation, spacing, font
+        bold: Make text bold (default False) - only used if copy_formatting is False
+        italic: Make text italic (default False) - only used if copy_formatting is False
+        alignment: Text alignment - "left", "center", "right", "justify" - only used if copy_formatting is False
+        style: Word style name - "Heading 1", "Title", etc. - only used if copy_formatting is False
     """
     doc = get_document()
 
@@ -711,7 +763,10 @@ async def insert_after_text(
     para._element.addnext(new_para._element)
 
     # Apply formatting
-    apply_paragraph_formatting(new_para, bold=bold, italic=italic, alignment=alignment, style=style)
+    if copy_formatting:
+        copy_paragraph_formatting(para, new_para)
+    else:
+        apply_paragraph_formatting(new_para, bold=bold, italic=italic, alignment=alignment, style=style)
 
     save_document(doc)
 
@@ -1802,12 +1857,6 @@ async def create_list(
 
     doc = get_document()
 
-    # Determine the list style
-    if list_type.lower() in ["number", "numbered", "ordered"]:
-        style_name = "List Number"
-    else:
-        style_name = "List Bullet"
-
     insert_after_para = None
     if query:
         match = find_paragraph_by_text(doc, query, threshold)
@@ -1815,20 +1864,49 @@ async def create_list(
             return {"error": f"No paragraph found matching: '{query}'"}
         idx, insert_after_para, score = match
 
+    # Helper to force XML numbering on a paragraph
+    def set_list_xml(paragraph, is_numbered=False):
+        # Retrieve or create pPr element
+        pPr = paragraph._element.get_or_add_pPr()
+        # Retrieve or create numPr element
+        numPr = pPr.get_or_add_numPr()
+        
+        # Set indentation level (ilvl) to 0
+        ilvl = numPr.get_or_add_ilvl()
+        ilvl.val = 0
+        
+        # Set numId
+        # 1 usually is bullets, 2+ numbers. This is a heuristic that works in most clean docs.
+        # If the doc has complex numbering, this might pick a different list style, 
+        # but it guarantees A list style is applied.
+        numId = numPr.get_or_add_numId()
+        if is_numbered:
+            numId.val = 2
+        else:
+            numId.val = 1
+
     # Create list items
     created_paragraphs = []
+    # Use "List Paragraph" as base style for font consistency
+    style_name = "List Paragraph" 
+    
     for item in items:
         para = doc.add_paragraph(item)
+        
+        # 1. Apply Style (for font/spacing)
         try:
             para.style = style_name
         except KeyError:
-            # Style doesn't exist, just leave as normal paragraph
             pass
+            
+        # 2. Apply XML Numbering (for actual numbers/bullets)
+        is_num = list_type.lower() in ["number", "numbered", "ordered"]
+        set_list_xml(para, is_numbered=is_num)
+
         created_paragraphs.append(para)
 
     # Move paragraphs to correct position if query was provided
     if insert_after_para:
-        # Move in reverse order to maintain order
         for para in reversed(created_paragraphs):
             insert_after_para._element.addnext(para._element)
 
@@ -1836,7 +1914,7 @@ async def create_list(
 
     return {
         "status": "success",
-        "message": f"Created {list_type} list with {len(items)} items",
+        "message": f"Created {list_type} list with {len(items)} items and forced XML properties",
         "items_count": len(items),
         "list_type": list_type
     }
@@ -2648,6 +2726,138 @@ async def duplicate_paragraph(
         "message": f"Duplicated paragraph {position} target",
         "duplicated_text": source_para.text[:100] + "..." if len(source_para.text) > 100 else source_para.text
     }
+
+
+@mcp.tool()
+async def copy_formatting(source_id: str, target_id: str) -> dict:
+    """
+    Copy formatting from one paragraph to another.
+    Applies style, alignment, and font properties (bold, italic, size, name) to the target.
+
+    Args:
+        source_id: ID of the paragraph to copy formatting FROM (e.g. "para-5")
+        target_id: ID of the paragraph to apply formatting TO (e.g. "para-10")
+    """
+    doc = get_document()
+
+    # Parse IDs
+    def parse_id(p_id):
+        if not p_id.startswith("para-"):
+            return None
+        try:
+            return int(p_id.replace("para-", ""))
+        except ValueError:
+            return None
+
+    source_idx = parse_id(source_id)
+    target_idx = parse_id(target_id)
+
+    if source_idx is None or source_idx < 0 or source_idx >= len(doc.paragraphs):
+        return {"error": f"Source paragraph {source_id} not found"}
+    
+    if target_idx is None or target_idx < 0 or target_idx >= len(doc.paragraphs):
+        return {"error": f"Target paragraph {target_id} not found"}
+
+    source_para = doc.paragraphs[source_idx]
+    target_para = doc.paragraphs[target_idx]
+
+    # 1. Copy Paragraph Style
+    if source_para.style:
+        try:
+            target_para.style = source_para.style
+        except:
+            pass
+
+    # 2. Copy Paragraph Alignment
+    if source_para.alignment:
+        target_para.alignment = source_para.alignment
+    
+    # 3. Copy Paragraph Formatting (ParagraphFormat properties)
+    # This covers indentation, spacing, etc.
+    if source_para.paragraph_format:
+        pf_source = source_para.paragraph_format
+        pf_target = target_para.paragraph_format
+        
+        if pf_source.left_indent is not None: pf_target.left_indent = pf_source.left_indent
+        if pf_source.right_indent is not None: pf_target.right_indent = pf_source.right_indent
+        if pf_source.first_line_indent is not None: pf_target.first_line_indent = pf_source.first_line_indent
+        if pf_source.space_before is not None: pf_target.space_before = pf_source.space_before
+        if pf_source.space_after is not None: pf_target.space_after = pf_source.space_after
+        if pf_source.line_spacing is not None: pf_target.line_spacing = pf_source.line_spacing
+        if pf_source.line_spacing_rule is not None: pf_target.line_spacing_rule = pf_source.line_spacing_rule
+
+    # 4. Copy Run Properties (Font, etc.)
+    # We apply the source's first run properties to ALL runs in the target
+    # This is a simplification but usually what's desired for "make this look like that"
+    if source_para.runs:
+        source_run = source_para.runs[0]
+        
+        for run in target_para.runs:
+            run.bold = source_run.bold
+            run.italic = source_run.italic
+            run.underline = source_run.underline
+            
+            if source_run.font.size:
+                run.font.size = source_run.font.size
+            if source_run.font.name:
+                run.font.name = source_run.font.name
+            if source_run.font.color and source_run.font.color.rgb:
+                run.font.color.rgb = source_run.font.color.rgb
+
+    save_document(doc)
+
+    return {
+        "status": "success",
+        "message": f"Copied formatting from {source_id} to {target_id}",
+        "source_style": source_para.style.name if source_para.style else "None"
+    }
+
+
+@mcp.tool()
+async def apply_list_numbering(start_id: str, count: int = 1, list_type: str = "number") -> dict:
+    """
+    Apply numbered/bullet formatting to a range of existing paragraphs.
+    This forces the XML numbering properties which makes the list markers appear.
+    
+    Args:
+        start_id: The ID of the first paragraph (e.g. "para-16")
+        count: Number of paragraphs to apply to (default 1).
+        list_type: "number" or "bullet"
+    """
+    doc = get_document()
+    
+    def get_index(pid):
+        try:
+            return int(pid.replace("para-", ""))
+        except:
+            return -1
+
+    start_idx = get_index(start_id)
+    if start_idx == -1 or start_idx >= len(doc.paragraphs):
+         return {"error": f"Invalid start_id {start_id}"}
+    
+    markup_applied = 0
+    for i in range(start_idx, start_idx + count):
+        if i >= len(doc.paragraphs): break
+        para = doc.paragraphs[i]
+        
+        # Apply XML properties directly using python-docx oxml access
+        # This bypasses style limitations
+        pPr = para._element.get_or_add_pPr()
+        numPr = pPr.get_or_add_numPr()
+        
+        # Indentation level 0
+        ilvl = numPr.get_or_add_ilvl()
+        ilvl.val = 0
+        
+        # NumID (1=bullet, 2=number usually)
+        numId = numPr.get_or_add_numId()
+        numId.val = 2 if list_type in ["number", "numbered"] else 1
+        
+        markup_applied += 1
+        
+    save_document(doc)
+    return {"status": "success", "applied_count": markup_applied}
 
 
 @mcp.tool()
